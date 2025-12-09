@@ -1,0 +1,7 @@
+{
+  "name": "Synapse",
+  "description": "A clinical decision-support tool that analyzes multiple clinician notes to detect critical contradictions, missing information, and timeline inconsistencies during patient handoffs.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
