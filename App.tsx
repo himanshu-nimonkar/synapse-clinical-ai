@@ -1,5 +1,4 @@
-
-import React, { useState, useEffect, Component, ErrorInfo } from 'react';
+import React, { useState, useEffect, ErrorInfo } from 'react';
 import NoteInput from './components/NoteInput';
 import AnalysisResults from './components/AnalysisResults';
 import PatientHeader from './components/PatientHeader';
@@ -10,14 +9,23 @@ import { generatePDF } from './services/pdfService';
 import { runUnitTests } from './services/testUtils';
 import { storageService } from './services/storageService';
 
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
 // Simple Error Boundary
-class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
-  constructor(props: { children: React.ReactNode }) {
+class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
     super(props);
     this.state = { hasError: false, error: null };
   }
 
-  static getDerivedStateFromError(error: Error) {
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
     return { hasError: true, error };
   }
 
@@ -128,7 +136,6 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!isEditingSource) return;
     const timeout = setTimeout(() => {
-        // Only push to stack if content is different from current history step
         if (historyStack.length > 0 && editSourceContent !== historyStack[historyStep]) {
             const newHistory = historyStack.slice(0, historyStep + 1);
             newHistory.push(editSourceContent);
@@ -188,34 +195,37 @@ const App: React.FC = () => {
 
   // RENAMED: handleResetCase - Performs a complete manual state reset
   const handleResetCase = () => {
-    if (hasUnsavedChanges && !window.confirm("Clear current case? Unsaved changes will be lost.")) return;
+    // If we have unsaved changes, confirm before wiping
+    if (hasUnsavedChanges && !window.confirm("Start a new case? Any unsaved changes to the current case will be discarded.")) return;
     
-    // 1. Clear Data Models
+    // 1. Reset Data Models
     setPatientDetails({ id: '', name: '', age: '', location: '', encounterDate: '' });
     setNotes([]);
     setResult(null);
-    
-    // 2. Clear UI & Session State
     setDismissedFlags({});
     setValidationErrors({});
     
-    // CRITICAL: Reset the case ID and history. This ensures the next save creates a NEW record.
+    // 2. Reset Session (Disconnect from any saved case)
+    // CRITICAL: Setting currentCaseId to null ensures the next save creates a NEW record.
     setCurrentCaseId(null); 
     setCurrentCaseHistory([]);
-    
-    setTestResults(null);
-    setGeminiStatus(null);
-    setError(null);
-    setIsAnalyzing(false);
-    setIsSaving(false);
-    setIsSourcesCollapsed(false);
     setHasUnsavedChanges(false);
     
-    // 3. Reset View
-    setActiveMobileTab('Sources'); // Return to source view
-    setResetKey(prev => prev + 1); // Force re-mount of inputs to clear textareas
+    // 3. Reset UI States & History
+    setError(null);
+    setTestResults(null);
+    setGeminiStatus(null);
+    setIsAnalyzing(false);
+    setIsSaving(false);
+    setViewSourceId(null); // Close modal if open
+    setHistoryStack([]);   // Clear undo history
+    setIsSourcesCollapsed(false);
     
-    setToastMessage("Case cleared. Starting fresh.");
+    // 4. Force Component Refresh (Input Fields, etc)
+    setActiveMobileTab('Sources');
+    setResetKey(prev => prev + 1);
+    
+    setToastMessage("Started new case.");
   }
 
   const handleAnalyze = async () => {
@@ -303,8 +313,8 @@ const App: React.FC = () => {
   };
 
   const loadCase = (c: Case) => {
-      // Only prompt if there are actual unsaved changes, not just because data exists
-      if (hasUnsavedChanges && !window.confirm("Load case? Current unsaved data will be lost.")) return;
+      // User requested to visit saved cases regardless of unsaved changes.
+      // Removed confirmation: if (hasUnsavedChanges && !window.confirm("Load case? Current unsaved data will be lost.")) return;
       
       // Restore full state
       setPatientDetails(c.patientDetails);
@@ -329,32 +339,23 @@ const App: React.FC = () => {
   };
 
   const deleteCase = async (id: string, e: React.MouseEvent) => {
-      // Prevent event bubbling to avoid triggering the "loadCase" on the parent div
+      // IMPORTANT: Stop propagation to prevent triggering loadCase on the parent row
       e.stopPropagation();
+      e.preventDefault();
       
       if (!window.confirm("Permanently delete this saved case?")) return;
       
-      // OPTIMISTIC UPDATE: Remove from UI immediately
-      setCases(prevCases => prevCases.filter(c => c.id !== id));
+      const updated = await storageService.deleteCase(id);
+      setCases(updated);
       
-      try {
-          await storageService.deleteCase(id);
-          
-          // If we deleted the currently active case, detach the session ID
-          if (currentCaseId === id) {
-              setCurrentCaseId(null);
-              setHasUnsavedChanges(true); // Treated as a new unsaved session
-              setToastMessage("Case deleted (Session active).");
-              logHistory('STORAGE_DELETED', 'Case deleted from DB.');
-          } else {
-              setToastMessage("Case deleted.");
-          }
-      } catch (error) {
-          console.error("Failed to delete case from storage:", error);
-          setToastMessage("Error deleting case. Refreshing list...");
-          // Fallback: reload from storage if deletion fails
-          const restored = await storageService.loadCases();
-          setCases(restored);
+      // If we deleted the currently active case, detach it so next save creates a new one
+      if (currentCaseId === id) {
+          setCurrentCaseId(null);
+          setHasUnsavedChanges(true); // It becomes an unsaved working copy
+          setToastMessage("Case deleted from storage (Working copy retained).");
+          logHistory('STORAGE_DELETED', 'Case deleted from DB but active in session.');
+      } else {
+          setToastMessage("Case deleted.");
       }
   };
 
@@ -579,492 +580,493 @@ const App: React.FC = () => {
   });
 
   return (
-    <ErrorBoundary>
     <div className="min-h-screen bg-slate-100 text-slate-900 font-sans flex flex-col">
-      
-      {/* 1. Global Safety Banner */}
-      <div className="bg-slate-900 text-white text-center py-2 text-[10px] font-bold uppercase tracking-widest z-50 sticky top-0 shadow-md">
-        ⚠️ Clinical Decision Support Tool • Not For Diagnostic Use • Verify All Output
-      </div>
-
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 shadow-sm z-40 relative">
-        <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-             <div className="h-10 w-10 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-md">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                  <path d="M8 12h8" />
-                  <path d="M12 8v8" />
-                </svg>
-             </div>
-             <div>
-               <h1 className="text-xl font-bold text-slate-800 tracking-tight leading-none">Synapse</h1>
-               <div className="flex gap-2 items-center">
-                 <p className="text-[10px] text-blue-600 font-bold uppercase tracking-wide">Intelligent Patient Safety</p>
-                 {hasUnsavedChanges && <span className="text-[9px] text-amber-500 font-bold px-1.5 py-0.5 bg-amber-50 rounded-full border border-amber-100">Unsaved Changes</span>}
-               </div>
-             </div>
-          </div>
-          <div className="flex items-center gap-2">
-             <button onClick={() => setShowDemoTest(!showDemoTest)} className="text-[10px] text-slate-500 font-bold hover:text-blue-600 mr-2 hidden sm:inline border border-slate-200 px-2 py-1 rounded bg-slate-50">
-                {showDemoTest ? 'Hide Test Panel' : 'Show Test Panel'}
-             </button>
-             
-             {/* Case Manager Dropdown */}
-             <div className="relative">
-                <button 
-                    onClick={() => { 
-                        setShowCaseList(!showCaseList); 
-                        setCaseSearchTerm(''); 
-                        setSearchStartDate('');
-                        setSearchEndDate('');
-                        setSearchMinSources('');
-                    }}
-                    className="text-xs font-semibold text-slate-600 hover:text-slate-800 px-3 py-1.5 border border-slate-200 rounded hover:bg-slate-50 flex items-center gap-1"
-                >
-                    Saved Cases ({cases.length})
-                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-                </button>
-                {showCaseList && (
-                    <div className="absolute right-0 mt-2 w-96 bg-white border border-slate-200 rounded-lg shadow-xl z-50 overflow-hidden animate-fade-in">
-                        <div className="p-2 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-                            <span className="text-[10px] font-bold text-slate-500 uppercase">Local Database</span>
-                            <button onClick={() => setShowCaseList(false)} className="text-slate-400 hover:text-slate-600">&times;</button>
-                        </div>
-                        
-                        {/* Advanced Search Filters - Styled to match Patient Context */}
-                        <div className="p-4 border-b border-slate-100 bg-white space-y-3">
-                            <div>
-                                <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Search Cases</label>
-                                <div className="relative">
-                                    <input 
-                                        type="text" 
-                                        placeholder="Filter by ID or Name..."
-                                        value={caseSearchTerm}
-                                        onChange={(e) => setCaseSearchTerm(e.target.value)}
-                                        className={inputClass}
-                                    />
-                                    <svg className="w-4 h-4 text-slate-400 absolute right-3 top-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-                                </div>
-                            </div>
-                            
-                            <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                    <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Start Date</label>
-                                    <input 
-                                        type="date" 
-                                        className={inputClass}
-                                        value={searchStartDate} 
-                                        onChange={e => setSearchStartDate(e.target.value)} 
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">End Date</label>
-                                    <input 
-                                        type="date" 
-                                        className={inputClass} 
-                                        value={searchEndDate} 
-                                        onChange={e => setSearchEndDate(e.target.value)} 
-                                    />
-                                </div>
-                            </div>
-                            
-                            <div>
-                                 <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Min Sources</label>
-                                 <input 
-                                    type="number" 
-                                    min="0" 
-                                    className={inputClass} 
-                                    placeholder="e.g. 2" 
-                                    value={searchMinSources} 
-                                    onChange={e => setSearchMinSources(e.target.value)} 
-                                />
-                            </div>
-                        </div>
-
-                        <div className="max-h-64 overflow-y-auto">
-                            {filteredCases.length === 0 && <div className="p-8 text-xs text-slate-400 text-center italic">No matching cases found.</div>}
-                            {filteredCases.map(c => {
-                                const high = c.result?.summary_stats?.high || 0;
-                                const med = c.result?.summary_stats?.medium || 0;
-                                return (
-                                <div key={c.id} className={`flex items-stretch border-b border-slate-50 last:border-0 group transition-colors ${currentCaseId === c.id ? 'bg-blue-50/50' : 'hover:bg-slate-50'}`}>
-                                    <div 
-                                        onClick={() => loadCase(c)} 
-                                        className="flex-grow p-3 cursor-pointer"
-                                    >
-                                        <div className="font-bold text-sm text-slate-700 truncate">{c.name}</div>
-                                        <div className="text-[10px] text-slate-500 mt-1 flex gap-2 items-center">
-                                            <span>{new Date(c.timestamp).toLocaleDateString()}</span>
-                                            <span>•</span>
-                                            <span>{c.notes.length} srcs</span>
-                                            {c.result && (
-                                                <>
-                                                 <span>•</span>
-                                                 <span className={`font-bold ${high > 0 ? 'text-red-500' : 'text-slate-400'}`}>{high} High / {med} Med</span>
-                                                </>
-                                            )}
-                                        </div>
-                                    </div>
-                                </div>
-                                );
-                            })}
-                        </div>
-                    </div>
-                )}
-             </div>
-          </div>
+      <ErrorBoundary>
+        {/* 1. Global Safety Banner */}
+        <div className="bg-slate-900 text-white text-center py-2 text-[10px] font-bold uppercase tracking-widest z-50 sticky top-0 shadow-md">
+          ⚠️ Clinical Decision Support Tool • Not For Diagnostic Use • Verify All Output
         </div>
-      </header>
 
-      {/* Demo Test Panel */}
-      {showDemoTest && (
-        <div className="bg-slate-800 text-slate-200 border-b border-slate-700 animate-fade-in shadow-inner">
-           <div className="max-w-screen-2xl mx-auto p-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center gap-4">
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                    <strong className="text-white text-sm">System Diagnostics & Demo</strong>
-                    {geminiStatus === 'Checking' && <span className="text-[10px] text-yellow-400 font-mono animate-pulse">CHECKING API...</span>}
-                    {geminiStatus === 'OK' && <span className="text-[10px] text-green-400 font-mono font-bold">API CONNECTED</span>}
-                    {geminiStatus === 'FAIL' && <span className="text-[10px] text-red-400 font-mono font-bold">API ERROR</span>}
-                </div>
-                {testResults && (
-                   <div className="text-[10px] flex gap-3 text-slate-300">
-                      <span className="text-green-400">PASSED: {testResults.passed}</span>
-                      <span className={testResults.failed > 0 ? "text-red-400" : "text-slate-400"}>FAILED: {testResults.failed}</span>
-                   </div>
-                )}
-                <p className="text-xs text-slate-400 mt-1">Tools to generate test assets for demo purposes.</p>
+        {/* Header */}
+        <header className="bg-white border-b border-slate-200 shadow-sm z-40 relative">
+          <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-md">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    <path d="M8 12h8" />
+                    <path d="M12 8v8" />
+                  </svg>
               </div>
-              <div className="flex items-center gap-3 flex-wrap">
-                  <button onClick={handleGenerateTestImage} className="text-xs text-slate-300 hover:text-white border border-slate-600 px-3 py-1.5 rounded bg-slate-700/50 whitespace-nowrap">
-                    Download "Stop Heparin" Scan
-                  </button>
-                  <button onClick={handleGenerateTestAudio} className="text-xs text-slate-300 hover:text-white border border-slate-600 px-3 py-1.5 rounded bg-slate-700/50 whitespace-nowrap">
-                    Download "Heparin Running" Audio
-                  </button>
-                  <button onClick={runDiagnostics} className="text-xs text-blue-300 hover:text-white underline decoration-dotted whitespace-nowrap">Run System Health Check</button>
-                  <button onClick={handleRunTest} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded font-bold text-xs shadow-md transition-colors flex items-center gap-2 whitespace-nowrap">
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                    Run Full Test Scenario
-                  </button>
+              <div>
+                <h1 className="text-xl font-bold text-slate-800 tracking-tight leading-none">Synapse</h1>
+                <div className="flex gap-2 items-center">
+                  <p className="text-[10px] text-blue-600 font-bold uppercase tracking-wide">Intelligent Patient Safety</p>
+                  {hasUnsavedChanges && <span className="text-[9px] text-amber-500 font-bold px-1.5 py-0.5 bg-amber-50 rounded-full border border-amber-100">Unsaved Changes</span>}
+                </div>
               </div>
-           </div>
-        </div>
-      )}
-
-      <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-screen-2xl mx-auto w-full">
-        
-        {/* Patient Header */}
-        <PatientHeader details={patientDetails} onChange={handlePatientDetailsChange} validationErrors={validationErrors} />
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-full">
-          
-          {/* Mobile Navigation Tabs */}
-          <div className="sm:hidden col-span-1 bg-white border border-slate-200 rounded-lg p-1 flex mb-4 shadow-sm sticky top-16 z-30">
-             {['Sources', 'Analysis', 'Timeline'].map(tab => (
-                 <button 
-                   key={tab}
-                   onClick={() => setActiveMobileTab(tab)}
-                   className={`flex-1 py-2 text-xs font-bold rounded ${activeMobileTab === tab ? 'bg-slate-800 text-white shadow' : 'text-slate-500 hover:bg-slate-50'}`}
-                 >
-                   {tab}
-                 </button>
-             ))}
-          </div>
-
-          {/* LEFT: Clinical Sources */}
-          <div className={`
-             lg:col-span-4 flex flex-col gap-6
-             ${activeMobileTab === 'Sources' ? 'flex' : 'hidden sm:flex'}
-          `}>
-            
-            {/* Tablet Collapsible Header */}
-            <div className="hidden sm:flex lg:hidden justify-between items-center bg-white p-3 rounded border border-slate-200 cursor-pointer" onClick={() => setIsSourcesCollapsed(!isSourcesCollapsed)}>
-               <span className="font-bold text-sm text-slate-700">Clinical Sources ({notes.length})</span>
-               <svg className={`w-5 h-5 text-slate-400 transform transition-transform ${isSourcesCollapsed ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
             </div>
-
-            <div className={`${isSourcesCollapsed ? 'hidden lg:flex' : 'flex'} flex-col gap-6`}>
-                <NoteInput key={resetKey} onAddNote={handleAddNote} noteCount={notes.length} />
-
-                <div className="flex flex-col gap-3">
-                <div className="flex justify-between items-end border-b border-slate-200 pb-1">
-                    <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wide">Source List</h2>
-                    <span className="text-[10px] font-mono text-slate-500">
-                        {notes.length} Added
-                    </span>
-                </div>
-                
-                <div className="space-y-2 max-h-[400px] overflow-y-auto pr-1">
-                    {notes.length === 0 && (
-                    <div className="py-8 px-4 text-center border-2 border-dashed border-slate-200 rounded-lg bg-slate-50/50">
-                        <p className="text-xs font-medium text-slate-400">No sources added.</p>
-                        <p className="text-[10px] text-slate-400 mt-1">Use the input above to add text, scans, or voice notes.</p>
-                    </div>
-                    )}
-                    {notes.map((note) => (
-                    <div 
-                        key={note.id} 
-                        draggable
-                        onDragStart={(e) => handleDragStart(e, note.id)}
-                        onDragOver={(e) => handleDragOver(e, note.id)}
-                        onDragEnd={handleDragEnd}
-                        onClick={() => handleViewSource(note.id)}
-                        className={`group bg-white p-3 rounded-lg border shadow-sm transition-all relative cursor-pointer
-                        ${draggedNoteId === note.id ? 'opacity-50 border-blue-400 border-dashed' : 'border-slate-200 hover:border-blue-400 hover:shadow-md'}
-                        `}
-                    >
-                        <div className="flex items-start justify-between mb-1">
-                        <div className="flex items-center gap-2">
-                            <span className="cursor-move text-slate-300 hover:text-slate-500 p-1">
-                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M7 2a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 2zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 8zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 14zm6-8a2 2 0 1 0-.001-4.001A2 2 0 0 0 13 6zm0 2a2 2 0 1 0 .001 4.001A2 2 0 0 0 13 8zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 13 14z" /></svg>
-                            </span>
-                            <span className={`flex items-center justify-center w-5 h-5 rounded text-[10px] font-bold text-white
-                                ${note.type === 'text' ? 'bg-slate-500' : note.type === 'image' ? 'bg-indigo-500' : 'bg-red-500'}
-                            `}>
-                                {note.type === 'text' ? 'T' : note.type === 'image' ? 'I' : 'A'}
-                            </span>
-                            <span className="text-sm font-bold text-slate-800 truncate max-w-[140px]">{note.label}</span>
-                        </div>
-                        <button onClick={(e) => { e.stopPropagation(); handleRemoveNote(note.id); }} className="text-slate-300 hover:text-red-500 p-1">
-                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                        </button>
-                        </div>
-                        <p className="text-xs text-slate-500 line-clamp-2 mb-2 h-8 leading-4 font-mono bg-slate-50 p-1 rounded">
-                        {note.content}
-                        </p>
-                        <div className="flex items-center justify-between text-[10px] text-slate-400">
-                           <div className="flex gap-2 items-center">
-                                <span>{new Date(note.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
-                                {note.confidence !== undefined && note.type !== 'text' && (
-                                    <span className={`px-1 rounded ${note.confidence > 80 ? 'text-green-600 bg-green-50' : 'text-amber-500 bg-amber-50'} font-bold`}>
-                                        {note.confidence}% Conf.
-                                    </span>
-                                )}
-                           </div>
-                           <span className="text-blue-600 font-medium opacity-0 group-hover:opacity-100 transition-opacity">Click to view</span>
-                        </div>
-                    </div>
-                    ))}
-                </div>
-
-                <div className="mt-4 pt-4 border-t border-slate-200">
-                    <button
-                    onClick={handleAnalyze}
-                    disabled={notes.length < 2 || isAnalyzing}
-                    className={`w-full py-3 px-4 rounded-lg shadow-sm text-sm font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-2
-                        ${notes.length < 2 || isAnalyzing 
-                        ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
-                        : 'bg-blue-700 text-white hover:bg-blue-800 shadow-md transform active:translate-y-0.5'}
-                    `}
-                    >
-                    {isAnalyzing ? (
-                        <>
-                        <svg className="animate-spin h-4 w-4 text-white" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/></svg>
-                        Checking Safety...
-                        </>
-                    ) : (
-                        "Analyze Handoff"
-                    )}
-                    </button>
-                </div>
-                </div>
-            </div>
-          </div>
-
-          {/* RIGHT: Analysis Report */}
-          <div className={`
-             lg:col-span-8 lg:h-full min-h-[500px] bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col overflow-hidden
-             hidden sm:flex
-          `}>
-             <div className="bg-slate-50 border-b border-slate-200 px-6 py-4 flex justify-between items-center">
-                <div>
-                  <h2 className="text-lg font-bold text-slate-800">Analysis Report</h2>
-                  <p className="text-xs text-slate-500">AI-generated decision support • Gemini 3 Pro</p>
-                </div>
-                {result && (
-                  <div className="flex items-center gap-2">
-                    <button onClick={handleExportPDF} className="text-xs font-bold text-slate-600 bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50 shadow-sm flex items-center gap-2">
-                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
-                       PDF
-                    </button>
-                    <button onClick={handleExportJSON} className="text-xs font-bold text-blue-700 bg-white border border-blue-200 px-3 py-1.5 rounded hover:bg-blue-50 shadow-sm flex items-center gap-2">
-                       <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                       JSON
-                    </button>
-                  </div>
-                )}
-             </div>
-
-             <div className="flex-grow p-6 overflow-hidden bg-white">
-                {error ? (
-                  <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
-                    <strong>Analysis Error:</strong> {error}
-                    <div className="mt-2 text-xs opacity-75">
-                       Troubleshooting: Check Test Panel for Gemini connection status. If model "gemini-3-pro-preview" is unavailable, the system automatically falls back to flash models.
-                    </div>
-                  </div>
-                ) : (
-                  <AnalysisResults 
-                    key={resetKey}
-                    result={result} 
-                    notes={notes} 
-                    dismissedFlags={dismissedFlags}
-                    onDismiss={handleDismissFlag}
-                    onRestore={handleRestoreFlag}
-                    activeMobileTab={activeMobileTab}
-                    onViewSource={handleViewSource}
-                    onSaveCase={saveCase}
-                    onClearCase={handleResetCase}
-                    isSaving={isSaving}
-                  />
-                )}
-             </div>
-             
-             {/* Footer Info */}
-             <div className="bg-slate-50 border-t border-slate-200 px-4 py-2 text-[10px] text-slate-400 text-center flex justify-between items-center">
-                <span>Local Device Storage • Encrypted</span>
-                {currentCaseHistory.length > 0 && (
-                    <button onClick={() => setShowHistoryModal(true)} className="flex items-center gap-1 hover:text-blue-600">
-                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                        History Log
-                    </button>
-                )}
-             </div>
-          </div>
-
-        </div>
-      </main>
-
-      {/* Toast Notification */}
-      {toastMessage && <Toast message={toastMessage} onClose={() => setToastMessage(null)} />}
-
-      {/* History Log Modal */}
-      {showHistoryModal && (
-          <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setShowHistoryModal(false)}>
-              <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[70vh] flex flex-col overflow-hidden animate-fade-in" onClick={e => e.stopPropagation()}>
-                  <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
-                      <h3 className="font-bold text-slate-700">Case History Log</h3>
-                      <button onClick={() => setShowHistoryModal(false)} className="text-slate-400 hover:text-slate-600">&times;</button>
-                  </div>
-                  <div className="flex-grow overflow-y-auto p-4">
-                      {currentCaseHistory.length === 0 ? (
-                          <div className="text-center text-slate-400 text-sm py-8">No history recorded yet.</div>
-                      ) : (
-                          <div className="relative border-l border-slate-200 ml-3 space-y-4">
-                              {currentCaseHistory.map((evt, idx) => (
-                                  <div key={idx} className="relative pl-4">
-                                      <div className="absolute -left-1.5 top-1.5 w-3 h-3 bg-blue-100 border border-blue-500 rounded-full"></div>
-                                      <div className="text-[10px] text-slate-400 font-mono mb-0.5">{new Date(evt.timestamp).toLocaleString()}</div>
-                                      <div className="text-sm font-bold text-slate-700">{evt.action.replace('_', ' ')}</div>
-                                      {evt.details && <div className="text-xs text-slate-500 mt-0.5">{evt.details}</div>}
-                                  </div>
-                              ))}
+            <div className="flex items-center gap-2">
+              <button onClick={() => setShowDemoTest(!showDemoTest)} className="text-[10px] text-slate-500 font-bold hover:text-blue-600 mr-2 hidden sm:inline border border-slate-200 px-2 py-1 rounded bg-slate-50">
+                  {showDemoTest ? 'Hide Test Panel' : 'Show Test Panel'}
+              </button>
+              
+              {/* Case Manager Dropdown */}
+              <div className="relative">
+                  <button 
+                      onClick={() => { 
+                          setShowCaseList(!showCaseList); 
+                          setCaseSearchTerm(''); 
+                          setSearchStartDate('');
+                          setSearchEndDate('');
+                          setSearchMinSources('');
+                      }}
+                      className="text-xs font-semibold text-slate-600 hover:text-slate-800 px-3 py-1.5 border border-slate-200 rounded hover:bg-slate-50 flex items-center gap-1"
+                  >
+                      Saved Cases ({cases.length})
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                  </button>
+                  {showCaseList && (
+                      <div className="absolute right-0 mt-2 w-96 bg-white border border-slate-200 rounded-lg shadow-xl z-50 overflow-hidden animate-fade-in">
+                          <div className="p-2 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase">Local Database</span>
+                              <button onClick={() => setShowCaseList(false)} className="text-slate-400 hover:text-slate-600">&times;</button>
                           </div>
+                          
+                          {/* Advanced Search Filters - Styled to match Patient Context */}
+                          <div className="p-4 border-b border-slate-100 bg-white space-y-3">
+                              <div>
+                                  <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Search Cases</label>
+                                  <div className="relative">
+                                      <input 
+                                          type="text" 
+                                          placeholder="Filter by ID or Name..."
+                                          value={caseSearchTerm}
+                                          onChange={(e) => setCaseSearchTerm(e.target.value)}
+                                          className={inputClass}
+                                      />
+                                      <svg className="w-4 h-4 text-slate-400 absolute right-3 top-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                                  </div>
+                              </div>
+                              
+                              <div className="grid grid-cols-2 gap-3">
+                                  <div>
+                                      <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Start Date</label>
+                                      <input 
+                                          type="date" 
+                                          className={inputClass}
+                                          value={searchStartDate} 
+                                          onChange={e => setSearchStartDate(e.target.value)} 
+                                      />
+                                  </div>
+                                  <div>
+                                      <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">End Date</label>
+                                      <input 
+                                          type="date" 
+                                          className={inputClass} 
+                                          value={searchEndDate} 
+                                          onChange={e => setSearchEndDate(e.target.value)} 
+                                      />
+                                  </div>
+                              </div>
+                              
+                              <div>
+                                  <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Min Sources</label>
+                                  <input 
+                                      type="number" 
+                                      min="0" 
+                                      className={inputClass} 
+                                      placeholder="e.g. 2" 
+                                      value={searchMinSources} 
+                                      onChange={e => setSearchMinSources(e.target.value)} 
+                                  />
+                              </div>
+                          </div>
+
+                          <div className="max-h-64 overflow-y-auto">
+                              {filteredCases.length === 0 && <div className="p-8 text-xs text-slate-400 text-center italic">No matching cases found.</div>}
+                              {filteredCases.map(c => {
+                                  // Dynamically calculate risk counts from conflicts list for display
+                                  // UPDATED: Calculate stats using ONLY active (non-dismissed) conflicts to reflect current state
+                                  const high = c.result?.critical_conflicts?.filter(x => x.severity === 'HIGH' && !c.dismissedFlags[x.id]).length || 0;
+                                  const med = c.result?.critical_conflicts?.filter(x => x.severity === 'MEDIUM' && !c.dismissedFlags[x.id]).length || 0;
+                                  return (
+                                  <div key={c.id} onClick={() => loadCase(c)} className={`p-3 hover:bg-slate-50 cursor-pointer border-b border-slate-50 last:border-0 group transition-colors ${currentCaseId === c.id ? 'bg-blue-50/50' : ''}`}>
+                                      <div className="flex justify-between items-start">
+                                          <div className="flex-1">
+                                              <div className="font-bold text-sm text-slate-700 truncate">{c.name}</div>
+                                              <div className="text-[10px] text-slate-500 mt-1 flex gap-2 items-center">
+                                                  <span>{new Date(c.timestamp).toLocaleDateString()}</span>
+                                                  <span>•</span>
+                                                  <span>{c.notes.length} srcs</span>
+                                                  {c.result && (
+                                                      <>
+                                                      <span>•</span>
+                                                      <span className={`font-bold ${high > 0 ? 'text-red-500' : 'text-slate-400'}`}>{high} High / {med} Med</span>
+                                                      </>
+                                                  )}
+                                              </div>
+                                          </div>
+                                          {/* Removed Delete button from UI as requested */}
+                                      </div>
+                                  </div>
+                                  );
+                              })}
+                          </div>
+                      </div>
+                  )}
+              </div>
+            </div>
+          </div>
+        </header>
+
+        {/* Demo Test Panel */}
+        {showDemoTest && (
+          <div className="bg-slate-800 text-slate-200 border-b border-slate-700 animate-fade-in shadow-inner">
+            <div className="max-w-screen-2xl mx-auto p-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center gap-4">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                      <strong className="text-white text-sm">System Diagnostics & Demo</strong>
+                      {geminiStatus === 'Checking' && <span className="text-[10px] text-yellow-400 font-mono animate-pulse">CHECKING API...</span>}
+                      {geminiStatus === 'OK' && <span className="text-[10px] text-green-400 font-mono font-bold">API CONNECTED</span>}
+                      {geminiStatus === 'FAIL' && <span className="text-[10px] text-red-400 font-mono font-bold">API ERROR</span>}
+                  </div>
+                  {testResults && (
+                    <div className="text-[10px] flex gap-3 text-slate-300">
+                        <span className="text-green-400">PASSED: {testResults.passed}</span>
+                        <span className={testResults.failed > 0 ? "text-red-400" : "text-slate-400"}>FAILED: {testResults.failed}</span>
+                    </div>
+                  )}
+                  <p className="text-xs text-slate-400 mt-1">Tools to generate test assets for demo purposes.</p>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                    <button onClick={handleGenerateTestImage} className="text-xs text-slate-300 hover:text-white border border-slate-600 px-3 py-1.5 rounded bg-slate-700/50 whitespace-nowrap">
+                      Download "Stop Heparin" Scan
+                    </button>
+                    <button onClick={handleGenerateTestAudio} className="text-xs text-slate-300 hover:text-white border border-slate-600 px-3 py-1.5 rounded bg-slate-700/50 whitespace-nowrap">
+                      Download "Heparin Running" Audio
+                    </button>
+                    <button onClick={runDiagnostics} className="text-xs text-blue-300 hover:text-white underline decoration-dotted whitespace-nowrap">Run System Health Check</button>
+                    <button onClick={handleRunTest} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded font-bold text-xs shadow-md transition-colors flex items-center gap-2 whitespace-nowrap">
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                      Run Full Test Scenario
+                    </button>
+                </div>
+            </div>
+          </div>
+        )}
+
+        <main className="flex-grow p-4 sm:p-6 lg:p-8 max-w-screen-2xl mx-auto w-full">
+          
+          {/* Patient Header */}
+          <PatientHeader details={patientDetails} onChange={handlePatientDetailsChange} validationErrors={validationErrors} />
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-full">
+            
+            {/* Mobile Navigation Tabs */}
+            <div className="sm:hidden col-span-1 bg-white border border-slate-200 rounded-lg p-1 flex mb-4 shadow-sm sticky top-16 z-30">
+              {['Sources', 'Analysis', 'Timeline'].map(tab => (
+                  <button 
+                    key={tab}
+                    onClick={() => setActiveMobileTab(tab)}
+                    className={`flex-1 py-2 text-xs font-bold rounded ${activeMobileTab === tab ? 'bg-slate-800 text-white shadow' : 'text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    {tab}
+                  </button>
+              ))}
+            </div>
+
+            {/* LEFT: Clinical Sources */}
+            <div className={`
+              lg:col-span-4 flex flex-col gap-6
+              ${activeMobileTab === 'Sources' ? 'flex' : 'hidden sm:flex'}
+            `}>
+              
+              {/* Tablet Collapsible Header */}
+              <div className="hidden sm:flex lg:hidden justify-between items-center bg-white p-3 rounded border border-slate-200 cursor-pointer" onClick={() => setIsSourcesCollapsed(!isSourcesCollapsed)}>
+                <span className="font-bold text-sm text-slate-700">Clinical Sources ({notes.length})</span>
+                <svg className={`w-5 h-5 text-slate-400 transform transition-transform ${isSourcesCollapsed ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+              </div>
+
+              <div className={`${isSourcesCollapsed ? 'hidden lg:flex' : 'flex'} flex-col gap-6`}>
+                  <NoteInput key={resetKey} onAddNote={handleAddNote} noteCount={notes.length} />
+
+                  <div className="flex flex-col gap-3">
+                  <div className="flex justify-between items-end border-b border-slate-200 pb-1">
+                      <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wide">Source List</h2>
+                      <span className="text-[10px] font-mono text-slate-500">
+                          {notes.length} Added
+                      </span>
+                  </div>
+                  
+                  <div className="space-y-2 max-h-[400px] overflow-y-auto pr-1">
+                      {notes.length === 0 && (
+                      <div className="py-8 px-4 text-center border-2 border-dashed border-slate-200 rounded-lg bg-slate-50/50">
+                          <p className="text-xs font-medium text-slate-400">No sources added.</p>
+                          <p className="text-[10px] text-slate-400 mt-1">Use the input above to add text, scans, or voice notes.</p>
+                      </div>
                       )}
+                      {notes.map((note) => (
+                      <div 
+                          key={note.id} 
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, note.id)}
+                          onDragOver={(e) => handleDragOver(e, note.id)}
+                          onDragEnd={handleDragEnd}
+                          onClick={() => handleViewSource(note.id)}
+                          className={`group bg-white p-3 rounded-lg border shadow-sm transition-all relative cursor-pointer
+                          ${draggedNoteId === note.id ? 'opacity-50 border-blue-400 border-dashed' : 'border-slate-200 hover:border-blue-400 hover:shadow-md'}
+                          `}
+                      >
+                          <div className="flex items-start justify-between mb-1">
+                          <div className="flex items-center gap-2">
+                              <span className="cursor-move text-slate-300 hover:text-slate-500 p-1">
+                                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M7 2a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 2zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 8zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 7 14zm6-8a2 2 0 1 0-.001-4.001A2 2 0 0 0 13 6zm0 2a2 2 0 1 0 .001 4.001A2 2 0 0 0 13 8zm0 6a2 2 0 1 0 .001 4.001A2 2 0 0 0 13 14z" /></svg>
+                              </span>
+                              <span className={`flex items-center justify-center w-5 h-5 rounded text-[10px] font-bold text-white
+                                  ${note.type === 'text' ? 'bg-slate-500' : note.type === 'image' ? 'bg-indigo-500' : 'bg-red-500'}
+                              `}>
+                                  {note.type === 'text' ? 'T' : note.type === 'image' ? 'I' : 'A'}
+                              </span>
+                              <span className="text-sm font-bold text-slate-800 truncate max-w-[140px]">{note.label}</span>
+                          </div>
+                          <button onClick={(e) => { e.stopPropagation(); handleRemoveNote(note.id); }} className="text-slate-300 hover:text-red-500 p-1">
+                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                          </button>
+                          </div>
+                          <p className="text-xs text-slate-500 line-clamp-2 mb-2 h-8 leading-4 font-mono bg-slate-50 p-1 rounded">
+                          {note.content}
+                          </p>
+                          <div className="flex items-center justify-between text-[10px] text-slate-400">
+                            <div className="flex gap-2 items-center">
+                                  <span>{new Date(note.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                                  {note.confidence !== undefined && note.type !== 'text' && (
+                                      <span className={`px-1 rounded ${note.confidence > 80 ? 'text-green-600 bg-green-50' : 'text-amber-500 bg-amber-50'} font-bold`}>
+                                          {note.confidence}% Conf.
+                                      </span>
+                                  )}
+                            </div>
+                            <span className="text-blue-600 font-medium opacity-0 group-hover:opacity-100 transition-opacity">Click to view</span>
+                          </div>
+                      </div>
+                      ))}
+                  </div>
+
+                  <div className="mt-4 pt-4 border-t border-slate-200">
+                      <button
+                      onClick={handleAnalyze}
+                      disabled={notes.length < 2 || isAnalyzing}
+                      className={`w-full py-3 px-4 rounded-lg shadow-sm text-sm font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-2
+                          ${notes.length < 2 || isAnalyzing 
+                          ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
+                          : 'bg-blue-700 text-white hover:bg-blue-800 shadow-md transform active:translate-y-0.5'}
+                      `}
+                      >
+                      {isAnalyzing ? (
+                          <>
+                          <svg className="animate-spin h-4 w-4 text-white" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/></svg>
+                          Checking Safety...
+                          </>
+                      ) : (
+                          "Analyze Handoff"
+                      )}
+                      </button>
+                  </div>
                   </div>
               </div>
-          </div>
-      )}
+            </div>
 
-      {/* View Source Modal (Now with Undo/Redo) */}
-      {viewSourceId && (
-        <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setViewSourceId(null)}>
-           <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="px-5 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
-                 <div>
-                    <h3 className="font-bold text-slate-800 text-lg">{notes.find(n => n.id === viewSourceId)?.label}</h3>
-                    <p className="text-xs text-slate-500">
-                        {notes.find(n => n.id === viewSourceId)?.type.toUpperCase()} Source • {new Date(notes.find(n => n.id === viewSourceId)?.timestamp || 0).toLocaleString()}
-                    </p>
-                 </div>
-                 <button onClick={() => setViewSourceId(null)} className="text-slate-400 hover:text-slate-600 p-2 hover:bg-slate-200 rounded-full transition-colors">
-                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                 </button>
+            {/* RIGHT: Analysis Report */}
+            <div className={`
+              lg:col-span-8 lg:h-full min-h-[500px] bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col overflow-hidden
+              hidden sm:flex
+            `}>
+              <div className="bg-slate-50 border-b border-slate-200 px-6 py-4 flex justify-between items-center">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-800">Analysis Report</h2>
+                    <p className="text-xs text-slate-500">AI-generated decision support • Gemini 3 Pro</p>
+                  </div>
+                  {result && (
+                    <div className="flex items-center gap-2">
+                      <button onClick={handleExportPDF} className="text-xs font-bold text-slate-600 bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50 shadow-sm flex items-center gap-2">
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                        PDF
+                      </button>
+                      <button onClick={handleExportJSON} className="text-xs font-bold text-blue-700 bg-white border border-blue-200 px-3 py-1.5 rounded hover:bg-blue-50 shadow-sm flex items-center gap-2">
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        JSON
+                      </button>
+                    </div>
+                  )}
               </div>
-              <div className="p-6 overflow-y-auto">
-                 <div className="mb-4">
-                     <div className="flex justify-between items-center mb-2">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide block">Extracted Content</span>
-                        {!isEditingSource ? (
-                            <button onClick={() => setIsEditingSource(true)} className="text-[10px] text-blue-600 hover:underline font-bold">Edit Content</button>
+
+              <div className="flex-grow p-6 overflow-hidden bg-white">
+                  {error ? (
+                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">
+                      <strong>Analysis Error:</strong> {error}
+                      <div className="mt-2 text-xs opacity-75">
+                        Troubleshooting: Check Test Panel for Gemini connection status. If model "gemini-3-pro-preview" is unavailable, the system automatically falls back to flash models.
+                      </div>
+                    </div>
+                  ) : (
+                    <AnalysisResults 
+                      key={resetKey}
+                      result={result} 
+                      notes={notes} 
+                      dismissedFlags={dismissedFlags}
+                      onDismiss={handleDismissFlag}
+                      onRestore={handleRestoreFlag}
+                      activeMobileTab={activeMobileTab}
+                      onViewSource={handleViewSource}
+                      onSaveCase={saveCase}
+                      onClearCase={handleResetCase}
+                      isSaving={isSaving}
+                    />
+                  )}
+              </div>
+              
+              {/* Footer Info */}
+              <div className="bg-slate-50 border-t border-slate-200 px-4 py-2 text-[10px] text-slate-400 text-center flex justify-between items-center">
+                  <span>Local Device Storage • Encrypted</span>
+                  {currentCaseHistory.length > 0 && (
+                      <button onClick={() => setShowHistoryModal(true)} className="flex items-center gap-1 hover:text-blue-600">
+                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                          History Log
+                      </button>
+                  )}
+              </div>
+            </div>
+
+          </div>
+        </main>
+
+        {/* Toast Notification */}
+        {toastMessage && <Toast message={toastMessage} onClose={() => setToastMessage(null)} />}
+
+        {/* History Log Modal */}
+        {showHistoryModal && (
+            <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setShowHistoryModal(false)}>
+                <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[70vh] flex flex-col overflow-hidden animate-fade-in" onClick={e => e.stopPropagation()}>
+                    <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+                        <h3 className="font-bold text-slate-700">Case History Log</h3>
+                        <button onClick={() => setShowHistoryModal(false)} className="text-slate-400 hover:text-slate-600">&times;</button>
+                    </div>
+                    <div className="flex-grow overflow-y-auto p-4">
+                        {currentCaseHistory.length === 0 ? (
+                            <div className="text-center text-slate-400 text-sm py-8">No history recorded yet.</div>
                         ) : (
-                            <div className="flex gap-2 items-center">
-                                {/* Undo/Redo Controls */}
-                                <div className="flex mr-3 bg-slate-100 rounded border border-slate-200">
-                                    <button 
-                                        onClick={handleUndo} 
-                                        disabled={historyStep <= 0}
-                                        className="p-1 text-slate-500 hover:text-slate-800 disabled:opacity-30 border-r border-slate-200"
-                                        title="Undo"
-                                    >
-                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
-                                    </button>
-                                    <button 
-                                        onClick={handleRedo} 
-                                        disabled={historyStep >= historyStack.length - 1}
-                                        className="p-1 text-slate-500 hover:text-slate-800 disabled:opacity-30"
-                                        title="Redo"
-                                    >
-                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
-                                    </button>
-                                </div>
-                                
-                                <button onClick={() => setIsEditingSource(false)} className="text-[10px] text-slate-500 hover:text-slate-700">Cancel</button>
-                                <button onClick={saveSourceEdit} className="text-[10px] text-green-600 hover:text-green-700 font-bold">Save Changes</button>
+                            <div className="relative border-l border-slate-200 ml-3 space-y-4">
+                                {currentCaseHistory.map((evt, idx) => (
+                                    <div key={idx} className="relative pl-4">
+                                        <div className="absolute -left-1.5 top-1.5 w-3 h-3 bg-blue-100 border border-blue-500 rounded-full"></div>
+                                        <div className="text-[10px] text-slate-400 font-mono mb-0.5">{new Date(evt.timestamp).toLocaleString()}</div>
+                                        <div className="text-sm font-bold text-slate-700">{evt.action.replace('_', ' ')}</div>
+                                        {evt.details && <div className="text-xs text-slate-500 mt-0.5">{evt.details}</div>}
+                                    </div>
+                                ))}
                             </div>
                         )}
-                     </div>
-                     
-                     {isEditingSource ? (
-                         <textarea
-                            value={editSourceContent}
-                            onChange={(e) => setEditSourceContent(e.target.value)}
-                            // Exact match to NoteInput styling
-                            className="w-full text-sm bg-[#f7fafc] border border-slate-200 rounded-md focus:ring-blue-500 focus:border-blue-500 px-3 py-2 text-slate-800 placeholder-slate-400 resize-none font-sans leading-relaxed min-h-[200px]"
-                         />
-                     ) : (
-                        <pre className="whitespace-pre-wrap text-sm font-mono text-slate-800 bg-slate-50 p-4 rounded-lg border border-slate-200 leading-relaxed">
-                            {notes.find(n => n.id === viewSourceId)?.content}
-                        </pre>
-                     )}
-                 </div>
-                 
-                 {notes.find(n => n.id === viewSourceId)?.originalFile && (
-                   <div className="mt-6 border-t border-slate-100 pt-4">
-                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-3">Original Media Input</p>
-                      {notes.find(n => n.id === viewSourceId)?.type === 'image' && (
-                        <div className="rounded-lg border border-slate-200 overflow-hidden bg-slate-100">
-                            <img src={`data:${notes.find(n => n.id === viewSourceId)?.mimeType};base64,${notes.find(n => n.id === viewSourceId)?.originalFile}`} alt="Original" className="max-w-full h-auto mx-auto" />
-                        </div>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* View Source Modal (Now with Undo/Redo) */}
+        {viewSourceId && (
+          <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setViewSourceId(null)}>
+            <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+                <div className="px-5 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                  <div>
+                      <h3 className="font-bold text-slate-800 text-lg">{notes.find(n => n.id === viewSourceId)?.label}</h3>
+                      <p className="text-xs text-slate-500">
+                          {notes.find(n => n.id === viewSourceId)?.type.toUpperCase()} Source • {new Date(notes.find(n => n.id === viewSourceId)?.timestamp || 0).toLocaleString()}
+                      </p>
+                  </div>
+                  <button onClick={() => setViewSourceId(null)} className="text-slate-400 hover:text-slate-600 p-2 hover:bg-slate-200 rounded-full transition-colors">
+                      <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                  </button>
+                </div>
+                <div className="p-6 overflow-y-auto">
+                  <div className="mb-4">
+                      <div className="flex justify-between items-center mb-2">
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wide block">Extracted Content</span>
+                          {!isEditingSource ? (
+                              <button onClick={() => setIsEditingSource(true)} className="text-[10px] text-blue-600 hover:underline font-bold">Edit Content</button>
+                          ) : (
+                              <div className="flex gap-2 items-center">
+                                  {/* Undo/Redo Controls */}
+                                  <div className="flex mr-3 bg-slate-100 rounded border border-slate-200">
+                                      <button 
+                                          onClick={handleUndo} 
+                                          disabled={historyStep <= 0}
+                                          className="p-1 text-slate-500 hover:text-slate-800 disabled:opacity-30 border-r border-slate-200"
+                                          title="Undo"
+                                      >
+                                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+                                      </button>
+                                      <button 
+                                          onClick={handleRedo} 
+                                          disabled={historyStep >= historyStack.length - 1}
+                                          className="p-1 text-slate-500 hover:text-slate-800 disabled:opacity-30"
+                                          title="Redo"
+                                      >
+                                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" /></svg>
+                                      </button>
+                                  </div>
+                                  
+                                  <button onClick={() => setIsEditingSource(false)} className="text-[10px] text-slate-500 hover:text-slate-700">Cancel</button>
+                                  <button onClick={saveSourceEdit} className="text-[10px] text-green-600 hover:text-green-700 font-bold">Save Changes</button>
+                              </div>
+                          )}
+                      </div>
+                      
+                      {isEditingSource ? (
+                          <textarea
+                              value={editSourceContent}
+                              onChange={(e) => setEditSourceContent(e.target.value)}
+                              // Exact match to NoteInput styling
+                              className="w-full text-sm bg-[#f7fafc] border border-slate-200 rounded-md focus:ring-blue-500 focus:border-blue-500 px-3 py-2 text-slate-800 placeholder-slate-400 resize-none font-sans leading-relaxed min-h-[200px]"
+                          />
+                      ) : (
+                          <pre className="whitespace-pre-wrap text-sm font-mono text-slate-800 bg-slate-50 p-4 rounded-lg border border-slate-200 leading-relaxed">
+                              {notes.find(n => n.id === viewSourceId)?.content}
+                          </pre>
                       )}
-                      {notes.find(n => n.id === viewSourceId)?.type === 'audio' && (
-                        <div className="bg-slate-50 p-4 rounded-lg border border-slate-200">
-                            <audio controls src={`data:${notes.find(n => n.id === viewSourceId)?.mimeType};base64,${notes.find(n => n.id === viewSourceId)?.originalFile}`} className="w-full" />
-                        </div>
-                      )}
-                   </div>
-                 )}
-                 
-                 {notes.find(n => n.id === viewSourceId)?.confidence !== undefined && (
-                     <div className="mt-4 flex items-center gap-2">
-                         <span className="text-xs font-bold text-slate-500">Ingestion Confidence:</span>
-                         <span className={`px-2 py-0.5 rounded text-xs font-bold ${notes.find(n => n.id === viewSourceId)!.confidence! > 80 ? "text-green-700 bg-green-100" : "text-amber-700 bg-amber-100"}`}>
-                             {notes.find(n => n.id === viewSourceId)?.confidence}%
-                         </span>
-                     </div>
-                 )}
-              </div>
-              <div className="px-5 py-4 border-t border-slate-200 bg-slate-50 flex justify-end">
-                 <button onClick={() => setViewSourceId(null)} className="px-6 py-2 bg-white border border-slate-300 text-slate-700 text-sm font-bold rounded-lg hover:bg-slate-100 shadow-sm transition-colors">Close Viewer</button>
-              </div>
-           </div>
-        </div>
-      )}
+                  </div>
+                  
+                  {notes.find(n => n.id === viewSourceId)?.originalFile && (
+                    <div className="mt-6 border-t border-slate-100 pt-4">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-3">Original Media Input</p>
+                        {notes.find(n => n.id === viewSourceId)?.type === 'image' && (
+                          <div className="rounded-lg border border-slate-200 overflow-hidden bg-slate-100">
+                              <img src={`data:${notes.find(n => n.id === viewSourceId)?.mimeType};base64,${notes.find(n => n.id === viewSourceId)?.originalFile}`} alt="Original" className="max-w-full h-auto mx-auto" />
+                          </div>
+                        )}
+                        {notes.find(n => n.id === viewSourceId)?.type === 'audio' && (
+                          <div className="bg-slate-50 p-4 rounded-lg border border-slate-200">
+                              <audio controls src={`data:${notes.find(n => n.id === viewSourceId)?.mimeType};base64,${notes.find(n => n.id === viewSourceId)?.originalFile}`} className="w-full" />
+                          </div>
+                        )}
+                    </div>
+                  )}
+                  
+                  {notes.find(n => n.id === viewSourceId)?.confidence !== undefined && (
+                      <div className="mt-4 flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-500">Ingestion Confidence:</span>
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold ${notes.find(n => n.id === viewSourceId)!.confidence! > 80 ? "text-green-700 bg-green-100" : "text-amber-700 bg-amber-100"}`}>
+                              {notes.find(n => n.id === viewSourceId)?.confidence}%
+                          </span>
+                      </div>
+                  )}
+                </div>
+                <div className="px-5 py-4 border-t border-slate-200 bg-slate-50 flex justify-end">
+                  <button onClick={() => setViewSourceId(null)} className="px-6 py-2 bg-white border border-slate-300 text-slate-700 text-sm font-bold rounded-lg hover:bg-slate-100 shadow-sm transition-colors">Close Viewer</button>
+                </div>
+            </div>
+          </div>
+        )}
+      </ErrorBoundary>
     </div>
-    </ErrorBoundary>
   );
 };
 

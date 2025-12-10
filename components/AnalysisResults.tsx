@@ -481,6 +481,13 @@ const AnalysisResults: React.FC<AnalysisResultsProps> = ({
   });
   const missingCategories = ["Allergies", "Active Medications", "Vitals / Trends", "Pending Tests", "Follow-up Actions", "Code Status", "Other"];
 
+  // DERIVED STATS (Calculated from active conflicts to reflect dynamic state)
+  const stats = {
+      high: activeConflicts.filter(c => c.severity === 'HIGH').length,
+      medium: activeConflicts.filter(c => c.severity === 'MEDIUM').length,
+      low: activeConflicts.filter(c => c.severity === 'LOW').length,
+  };
+
   return (
     <div className="space-y-6 h-full overflow-y-auto pr-2 pb-10 relative flex flex-col">
       {/* Toast Feedback */}
@@ -531,9 +538,9 @@ const AnalysisResults: React.FC<AnalysisResultsProps> = ({
                     </div>
                     <p className="text-sm text-slate-800 leading-relaxed font-medium">{result.patient_trajectory_summary}</p>
                     <div className="mt-3 flex gap-3 text-[10px] text-slate-500 uppercase font-bold tracking-wide">
-                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500"></span> {result.summary_stats?.high || 0} High Risk</span>
-                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400"></span> {result.summary_stats?.medium || 0} Medium</span>
-                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-400"></span> {result.summary_stats?.low || 0} Low</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500"></span> {stats.high} High Risk</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400"></span> {stats.medium} Medium</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-400"></span> {stats.low} Low</span>
                     </div>
                 </div>
             </section>

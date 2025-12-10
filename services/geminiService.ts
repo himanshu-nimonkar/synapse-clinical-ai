@@ -22,6 +22,7 @@ RULES:
    - Provide "suggested_questions": 1-2 generic clarification prompts.
    - If code status is not mentioned, add a Missing Item in "Code Status".
    - If vitals are missing or no trend is visible, add a Missing Item in "Vitals / Trends".
+   - If active medications are not clearly listed, add a Missing Item in "Active Medications" with importance "HIGH". Use description: "Key medications the patient is currently taking are not clearly documented." and why_it_matters: "Ensures continuity of care and prevents therapeutic gaps or omissions." and suggested_questions: ["What are the patient's current home medications?", "Are there any scheduled or PRN medications to be continued?"].
 3. "Patient Trajectory Summary": Concise 2-3 sentence summary.
 4. "Timeline Events": Chronological list of key events/observations.
    - "Severity": Assign a severity (HIGH, MEDIUM, LOW, NEUTRAL) to each event. 
@@ -38,15 +39,6 @@ const schema: Schema = {
   type: Type.OBJECT,
   properties: {
     patient_trajectory_summary: { type: Type.STRING },
-    summary_stats: {
-      type: Type.OBJECT,
-      properties: {
-        high: { type: Type.INTEGER },
-        medium: { type: Type.INTEGER },
-        low: { type: Type.INTEGER },
-      },
-      required: ["high", "medium", "low"]
-    },
     critical_conflicts: {
       type: Type.ARRAY,
       items: {
@@ -110,7 +102,7 @@ const schema: Schema = {
       enum: ["HIGH", "MEDIUM", "LOW"],
     }
   },
-  required: ["patient_trajectory_summary", "critical_conflicts", "potentially_missing_information", "timeline_events", "analysis_confidence", "summary_stats"],
+  required: ["patient_trajectory_summary", "critical_conflicts", "potentially_missing_information", "timeline_events", "analysis_confidence"],
 };
 
 const getAiClient = () => {
@@ -321,6 +313,13 @@ export const analyzeNotes = async (notes: Note[]): Promise<AnalysisResult> => {
       parsed.critical_conflicts?.forEach((c, i) => { if(!c.id) c.id = `conflict-${i}`; });
       parsed.potentially_missing_information?.forEach((m, i) => { if(!m.id) m.id = `missing-${i}`; });
       
+      // Manually calculate summary stats from actual conflicts to avoid AI hallucination
+      parsed.summary_stats = {
+          high: parsed.critical_conflicts?.filter(c => c.severity === 'HIGH').length || 0,
+          medium: parsed.critical_conflicts?.filter(c => c.severity === 'MEDIUM').length || 0,
+          low: parsed.critical_conflicts?.filter(c => c.severity === 'LOW').length || 0
+      };
+
       logGeminiRequest({ timestamp: new Date().toISOString(), type: 'ANALYSIS', model: usedModel, status: 'SUCCESS' });
       return parsed;
     }, 0, "ANALYSIS");
